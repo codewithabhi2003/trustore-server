@@ -69,10 +69,14 @@ const registerStore = asyncHandler(async (req, res) => {
       return res.status(400).json({ success: false, message: 'Both Aadhaar card and shop license documents are required' });
     }
 
-    const [aadhaarUpload, licenseUpload] = await Promise.all([
+    const uploads = [
       uploadBuffer(req.files.aadhaarCard[0].buffer, 'trustore/documents'),
       uploadBuffer(req.files.shopLicense[0].buffer, 'trustore/documents'),
-    ]);
+    ];
+    if (req.files?.logo?.[0]) {
+      uploads.push(uploadBuffer(req.files.logo[0].buffer, 'trustore/logos'));
+    }
+    const [aadhaarUpload, licenseUpload, logoUpload] = await Promise.all(uploads);
 
     const store = await Store.create({
       ownerId: req.user._id,
@@ -87,6 +91,7 @@ const registerStore = asyncHandler(async (req, res) => {
         aadhaarCard: { url: aadhaarUpload.url, publicId: aadhaarUpload.publicId },
         shopLicense: { url: licenseUpload.url, publicId: licenseUpload.publicId },
       },
+      logo: logoUpload ? logoUpload.url : null,
       verificationStatus: 'pending',
     });
 

@@ -25,6 +25,7 @@ router.post(
   upload.fields([
     { name: 'aadhaarCard', maxCount: 1 },
     { name: 'shopLicense', maxCount: 1 },
+    { name: 'logo', maxCount: 1 },
   ]),
   registerStore
 );
