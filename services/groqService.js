@@ -16,7 +16,7 @@ Example output:
 
 const extractProductsFromText = async (userInput) => {
   const completion = await groq.chat.completions.create({
-    model: 'llama3-8b-8192', // free tier model
+    model: 'llama-3.1-8b-instant', // llama3-8b-8192 was decommissioned by Groq; this is its direct replacement
     messages: [
       { role: 'system', content: SYSTEM_PROMPT },
       { role: 'user', content: userInput },

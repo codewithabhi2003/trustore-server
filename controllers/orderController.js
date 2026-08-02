@@ -1,7 +1,7 @@
 const asyncHandler = require('express-async-handler');
 const Order = require('../models/Order');
 const Store = require('../models/Store');
-const { notifyOrderStatusChange, notifyNewOrder } = require('../services/notificationService');
+const { notifyOrderStatusChange } = require('../services/notificationService');
 
 // POST /api/orders
 // Cart items carry a storeId, since a cluster order can span more than one store.
@@ -48,15 +48,6 @@ const createOrder = asyncHandler(async (req, res) => {
 
   const totalAmount = createdOrders.reduce((sum, o) => sum + o.totalAmount, 0);
 
-  // Best-effort — a notification failure shouldn't block the order from completing.
-  const stores = await Store.find({ _id: { $in: createdOrders.map((o) => o.storeId) } });
-  await Promise.all(
-    createdOrders.map((order) => {
-      const store = stores.find((s) => s._id.toString() === order.storeId.toString());
-      return store ? notifyNewOrder(store, order) : null;
-    })
-  );
-
   // Top-level _id kept for a simple single-store checkout flow; orderIds covers multi-store carts.
   res.status(201).json({
     success: true,
@@ -81,7 +72,9 @@ const getStoreOrders = asyncHandler(async (req, res) => {
   if (!store) {
     return res.status(404).json({ success: false, message: 'No store found for this account' });
   }
-  const orders = await Order.find({ storeId: store._id })
+  // Only orders with a confirmed payment — an order created but never paid for (payment
+  // failed, or the customer closed the checkout) shouldn't show up in the store's queue.
+  const orders = await Order.find({ storeId: store._id, 'payment.status': 'paid' })
     .populate('customerId', 'name email phone')
     .sort({ createdAt: -1 });
   res.json({ success: true, orders });

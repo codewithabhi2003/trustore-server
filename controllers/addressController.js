@@ -30,7 +30,7 @@ const getAddresses = asyncHandler(async (req, res) => {
 
 // POST /api/addresses
 const addAddress = asyncHandler(async (req, res) => {
-  const { label, street, city, state, pincode, fullAddress, location, isDefault } = req.body;
+  const { label, street, city, state, pincode, location, isDefault } = req.body;
 
   if (!street || !city) {
     return res.status(400).json({ success: false, message: 'Street and city are required' });
@@ -39,6 +39,10 @@ const addAddress = asyncHandler(async (req, res) => {
   if (isDefault) {
     await Address.updateMany({ userId: req.user._id }, { $set: { isDefault: false } });
   }
+
+  // Built server-side rather than trusting the client to send it — guarantees every
+  // address always has a real display string, regardless of which UI created it.
+  const fullAddress = [street, city, state, pincode].filter(Boolean).join(', ');
 
   const address = await Address.create({
     userId: req.user._id,
@@ -63,6 +67,8 @@ const updateAddress = asyncHandler(async (req, res) => {
   }
 
   Object.assign(address, req.body);
+  // Recompute fullAddress if any of its component fields changed.
+  address.fullAddress = [address.street, address.city, address.state, address.pincode].filter(Boolean).join(', ');
   await address.save();
 
   res.json({ success: true, address });
