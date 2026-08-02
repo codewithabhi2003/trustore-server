@@ -33,14 +33,21 @@ const createReview = asyncHandler(async (req, res) => {
   order.isReviewed = true;
   await order.save();
 
-  // Recalculate the store's aggregate rating
-  const store = await Store.findById(storeId);
-  if (store) {
-    const newTotal = store.totalRatings + 1;
-    const newRating = (store.rating * store.totalRatings + rating) / newTotal;
-    store.rating = Math.round(newRating * 10) / 10;
-    store.totalRatings = newTotal;
-    await store.save();
+  // Atomic — $inc can never lose a concurrent review's contribution the way a
+  // read-then-write (store.rating = ...; store.save()) can under a race. ratingSum and
+  // totalRatings are always exactly correct; the displayed `rating` average is
+  // recomputed right after from those authoritative totals.
+  const updatedStore = await Store.findByIdAndUpdate(
+    storeId,
+    { $inc: { ratingSum: rating, totalRatings: 1 } },
+    { new: true }
+  );
+
+  if (updatedStore) {
+    const avg = Math.round((updatedStore.ratingSum / updatedStore.totalRatings) * 10) / 10;
+    await Store.findByIdAndUpdate(storeId, { $set: { rating: avg } });
+  } else {
+    console.warn(`[reviewController.createReview] Store ${storeId} not found — rating not updated for review ${review._id}`);
   }
 
   res.status(201).json({ success: true, review });

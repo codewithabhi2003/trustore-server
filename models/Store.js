@@ -30,6 +30,7 @@ const storeSchema = new mongoose.Schema({
   adminNote: { type: String, default: '' },
   isActive: { type: Boolean, default: true },
   rating: { type: Number, default: 0 },
+  ratingSum: { type: Number, default: 0 }, // running total — lets rating recompute atomically, race-safe under concurrent reviews
   totalRatings: { type: Number, default: 0 },
   totalOrders: { type: Number, default: 0 },
   logo: { type: String, default: null },
