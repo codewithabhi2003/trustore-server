@@ -7,6 +7,7 @@ const {
   getStoreById,
   getStoreProducts,
   geocode,
+  toggleOpen,
 } = require('../controllers/storeController');
 const { protect } = require('../middleware/authMiddleware');
 const { authorize } = require('../middleware/roleMiddleware');
@@ -32,6 +33,7 @@ router.post(
 
 router.get('/my-store', protect, authorize('storeOwner'), getMyStore);
 router.put('/my-store', protect, authorize('storeOwner'), updateMyStore);
+router.patch('/my-store/toggle-open', protect, authorize('storeOwner'), toggleOpen);
 
 router.get('/:id', getStoreById);
 router.get('/:id/products', getStoreProducts);

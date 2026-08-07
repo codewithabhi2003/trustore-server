@@ -170,6 +170,17 @@ const updateMyStore = asyncHandler(async (req, res) => {
   res.json({ success: true, store });
 });
 
+// PATCH /api/stores/my-store/toggle-open (storeOwner) — quick open/closed switch
+const toggleOpen = asyncHandler(async (req, res) => {
+  const store = await Store.findOne({ ownerId: req.user._id });
+  if (!store) {
+    return res.status(404).json({ success: false, message: 'No store found for this account' });
+  }
+  store.isOpen = !store.isOpen;
+  await store.save();
+  res.json({ success: true, store });
+});
+
 // GET /api/stores/:id (public — only ever shows approved stores)
 const getStoreById = asyncHandler(async (req, res) => {
   const store = await Store.findOne({ _id: req.params.id, verificationStatus: 'approved', isActive: true });
@@ -197,4 +208,5 @@ module.exports = {
   getStoreById,
   getStoreProducts,
   geocode,
+  toggleOpen,
 };
