@@ -12,6 +12,7 @@ const findBestCluster = async (customerLat, customerLng, extractedProducts, radi
   const nearbyStores = await Store.find({
     verificationStatus: 'approved',
     isActive: true,
+    isOpen: { $ne: false },
     location: {
       $near: {
         $geometry: { type: 'Point', coordinates: [customerLng, customerLat] },
@@ -193,6 +194,7 @@ const findBorderStores = async (clusterStores, missingProducts, thresholdM) => {
     const candidateStores = await Store.find({
       verificationStatus: 'approved',
       isActive: true,
+      isOpen: { $ne: false },
       _id: { $nin: clusterStoreIds },
       location: {
         $near: {
