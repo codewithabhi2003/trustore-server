@@ -122,6 +122,7 @@ const getNearbyStores = asyncHandler(async (req, res) => {
   const stores = await Store.find({
     verificationStatus: 'approved',
     isActive: true,
+    isOpen: { $ne: false },
     location: {
       $near: {
         $geometry: { type: 'Point', coordinates: [parseFloat(lng), parseFloat(lat)] },
