@@ -29,6 +29,7 @@ const storeSchema = new mongoose.Schema({
   },
   adminNote: { type: String, default: '' },
   isActive: { type: Boolean, default: true },
+  isOpen: { type: Boolean, default: true }, // owner-controlled — store stays listed to customers either way, just shown as closed
   rating: { type: Number, default: 0 },
   ratingSum: { type: Number, default: 0 }, // running total — lets rating recompute atomically, race-safe under concurrent reviews
   totalRatings: { type: Number, default: 0 },
