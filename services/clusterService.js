@@ -116,6 +116,21 @@ const findBestCluster = async (customerLat, customerLng, extractedProducts, radi
     }
   }
 
+  // ── STEP 7: Smart substitutions for anything still missing ───────────────
+  // Border stores fill *the same* item from a neighbor; substitutes suggest a
+  // *different but related* in-stock item instead (e.g. Basmati unavailable ->
+  // suggest Sona Masoori). Still-missing = not found in this cluster AND not
+  // covered by a border store either.
+  const fillableByBorder = new Set((bestCluster.borderStores || []).flatMap((b) => b.fills));
+  const stillMissing = missingProducts.filter((p) => !fillableByBorder.has(p.requestedName));
+
+  if (stillMissing.length > 0) {
+    const substitutes = await findSubstitutes(bestCluster.stores, stillMissing);
+    if (Object.keys(substitutes).length > 0) {
+      bestCluster.substitutes = substitutes;
+    }
+  }
+
   return {
     success: true,
     bestCluster,
@@ -239,6 +254,52 @@ const findBorderStores = async (clusterStores, missingProducts, thresholdM) => {
   }
 
   return borderResults;
+};
+
+// Common words that are too generic to search on alone (would match almost anything).
+const STOPWORDS = new Set(['of', 'a', 'an', 'the', 'and', 'or', 'for', 'with', 'pack', 'piece']);
+
+/**
+ * Smart substitution — NOT true semantic/AI matching (this stack has no embeddings or
+ * NLP service). It's a keyword-overlap heuristic: break the requested name + its Groq
+ * keywords into significant words, then look for other in-stock products in the cluster
+ * that share at least one of those words. Good enough to catch "basmati rice" -> "sona
+ * masoori rice" (both share "rice") without needing external AI infrastructure.
+ */
+const findSubstitutes = async (clusterStores, stillMissingProducts) => {
+  const storeIds = clusterStores.map((s) => s._id);
+  const results = {};
+
+  for (const missing of stillMissingProducts) {
+    const words = [missing.requestedName, ...(missing.products?.[0]?.keywords || [])]
+      .join(' ')
+      .toLowerCase()
+      .split(/\s+/)
+      .filter((w) => w.length > 2 && !STOPWORDS.has(w));
+
+    if (words.length === 0) continue;
+
+    const candidates = await Product.find({
+      storeId: { $in: storeIds },
+      isAvailable: true,
+      stock: { $gt: 0 },
+      $or: words.map((w) => ({
+        $or: [
+          { name: { $regex: escapeRegex(w), $options: 'i' } },
+          { tags: { $regex: escapeRegex(w), $options: 'i' } },
+          { nameKeywords: { $regex: escapeRegex(w), $options: 'i' } },
+        ],
+      })),
+    })
+      .populate('storeId', 'storeName location')
+      .limit(3);
+
+    if (candidates.length > 0) {
+      results[missing.requestedName] = candidates;
+    }
+  }
+
+  return results;
 };
 
 // Prevents user-supplied product names from breaking the $regex query
