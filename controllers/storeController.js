@@ -1,6 +1,7 @@
 const asyncHandler = require('express-async-handler');
 const Store = require('../models/Store');
 const Product = require('../models/Product');
+const DemandLog = require('../models/DemandLog');
 const { uploadBuffer } = require('../services/cloudinaryService');
 const { geocodeAddress } = require('../services/geocodingService');
 const { haversineDistance } = require('../utils/geoUtils');
@@ -182,6 +183,59 @@ const toggleOpen = asyncHandler(async (req, res) => {
   res.json({ success: true, store });
 });
 
+// GET /api/stores/my-store/demand-insights (storeOwner)
+// "Customers nearby searched for X this week but you don't stock it" — built entirely
+// from the AI assistant's search history (DemandLog), cross-referenced against what this
+// store already carries.
+const getDemandInsights = asyncHandler(async (req, res) => {
+  const store = await Store.findOne({ ownerId: req.user._id });
+  if (!store) {
+    return res.status(404).json({ success: false, message: 'No store found for this account' });
+  }
+
+  const RADIUS_M = 5000; // matches the app's default cluster search radius
+  const WINDOW_DAYS = 30;
+  const since = new Date(Date.now() - WINDOW_DAYS * 24 * 60 * 60 * 1000);
+
+  const [nearbyDemand, myProducts] = await Promise.all([
+    DemandLog.find({
+      createdAt: { $gte: since },
+      location: {
+        $near: {
+          $geometry: { type: 'Point', coordinates: store.location.coordinates },
+          $maxDistance: RADIUS_M,
+        },
+      },
+    }).select('itemName keywords wasFulfilled'),
+    Product.find({ storeId: store._id }).select('name tags nameKeywords'),
+  ]);
+
+  // Every name/keyword/tag this store already carries, lowercased, for a quick lookup.
+  const stockedTerms = new Set();
+  myProducts.forEach((p) => {
+    stockedTerms.add(p.name.toLowerCase());
+    (p.tags || []).forEach((t) => stockedTerms.add(t.toLowerCase()));
+    (p.nameKeywords || []).forEach((k) => stockedTerms.add(k.toLowerCase()));
+  });
+
+  const alreadyStocked = (log) =>
+    stockedTerms.has(log.itemName) || (log.keywords || []).some((k) => stockedTerms.has(k.toLowerCase()));
+
+  const counts = new Map();
+  for (const log of nearbyDemand) {
+    if (alreadyStocked(log)) continue;
+    const key = log.itemName;
+    const entry = counts.get(key) || { itemName: key, searchCount: 0, fulfilledElsewhere: 0 };
+    entry.searchCount += 1;
+    if (log.wasFulfilled) entry.fulfilledElsewhere += 1;
+    counts.set(key, entry);
+  }
+
+  const insights = [...counts.values()].sort((a, b) => b.searchCount - a.searchCount).slice(0, 10);
+
+  res.json({ success: true, insights, windowDays: WINDOW_DAYS });
+});
+
 // GET /api/stores/:id (public — only ever shows approved stores)
 const getStoreById = asyncHandler(async (req, res) => {
   const store = await Store.findOne({ _id: req.params.id, verificationStatus: 'approved', isActive: true });
@@ -210,4 +264,5 @@ module.exports = {
   getStoreProducts,
   geocode,
   toggleOpen,
+  getDemandInsights,
 };
