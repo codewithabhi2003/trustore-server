@@ -2,307 +2,656 @@ const Store = require('../models/Store');
 const Product = require('../models/Product');
 const { haversineDistance } = require('../utils/geoUtils');
 
-/**
- * MAIN FUNCTION — called after Groq extracts products
- * Input: customer coordinates, extracted product list
- * Output: ranked clusters with matched products
- */
-const findBestCluster = async (customerLat, customerLng, extractedProducts, radiusKm = 5) => {
-  // ── STEP 1: Find all verified stores within radius ────────────────────────
+const DEFAULT_RADIUS_KM = 2;
+const CLUSTER_DIAMETER_M = 500;
+const BORDER_RADIUS_M = 100;
+
+const SCORE_WEIGHTS = {
+  availability: 0.5,
+  distance: 0.25,
+  efficiency: 0.15,
+  rating: 0.1,
+};
+
+const STOPWORDS = new Set([
+  'of', 'a', 'an', 'the', 'and', 'or', 'for', 'with', 'pack', 'piece',
+]);
+
+const findBestCluster = async (
+  customerLat,
+  customerLng,
+  extractedProducts,
+  radiusKm = DEFAULT_RADIUS_KM
+) => {
+  validateSearchInput(customerLat, customerLng, extractedProducts, radiusKm);
+
   const nearbyStores = await Store.find({
     verificationStatus: 'approved',
     isActive: true,
     isOpen: { $ne: false },
     location: {
       $near: {
-        $geometry: { type: 'Point', coordinates: [customerLng, customerLat] },
-        $maxDistance: radiusKm * 1000, // convert km to meters
+        $geometry: {
+          type: 'Point',
+          coordinates: [customerLng, customerLat],
+        },
+        $maxDistance: radiusKm * 1000,
       },
     },
   }).select('storeName location address rating totalOrders');
 
-  if (nearbyStores.length === 0) {
-    return { success: false, message: 'No verified stores found near your location.' };
+  if (!nearbyStores.length) {
+    return {
+      success: false,
+      message: 'No verified stores found near your location.',
+      bestCluster: null,
+      allClusters: [],
+      nearbyStores: 0,
+      borderStores: [],
+    };
   }
 
-  // ── STEP 2: Build clusters using DBSCAN-like proximity grouping ──────────
-  // Group stores that are within 500m of each other into the same cluster
-  const CLUSTER_RADIUS_M = 500;
-  const clusters = buildClusters(nearbyStores, CLUSTER_RADIUS_M);
+  const clusters = buildClusters(nearbyStores, CLUSTER_DIAMETER_M);
 
-  // ── STEP 3: For each cluster, find available products ────────────────────
   const clustersWithProducts = await Promise.all(
     clusters.map(async (cluster) => {
-      const storeIds = cluster.stores.map((s) => s._id);
+      const storeIds = cluster.stores.map((store) => store._id);
 
-      // For each requested product, search across all stores in this cluster
       const productMatches = await Promise.all(
         extractedProducts.map(async (requestedProduct) => {
-          const keywords = requestedProduct.keywords || [requestedProduct.name];
-          const matchedProducts = await Product.find({
-            storeId: { $in: storeIds },
-            isAvailable: true,
-            stock: { $gt: 0 },
-            $or: [
-              { name: { $regex: escapeRegex(requestedProduct.name), $options: 'i' } },
-              { tags: { $in: keywords } },
-              { nameKeywords: { $in: keywords } },
-            ],
-          }).populate('storeId', 'storeName location');
+          const matchedProducts = await findMatchingProducts(
+            requestedProduct,
+            storeIds
+          );
+
+          // Return every matching in-stock product as a selectable option.
+          const options = matchedProducts
+            .map(toProductOption)
+            .sort((a, b) => {
+              const priceA = Number.isFinite(a.price)
+                ? a.price
+                : Number.POSITIVE_INFINITY;
+              const priceB = Number.isFinite(b.price)
+                ? b.price
+                : Number.POSITIVE_INFINITY;
+
+              return priceA - priceB || a.name.localeCompare(b.name);
+            });
 
           return {
-            requestedName: requestedProduct.name,
-            requestedQuantity: requestedProduct.quantity,
-            requestedUnit: requestedProduct.unit,
-            available: matchedProducts.length > 0,
+            requestedName: requestedProduct.name.trim(),
+            requestedQuantity: requestedProduct.quantity ?? null,
+            requestedUnit: requestedProduct.unit ?? null,
+            requestedKeywords: normalizeKeywords(
+              requestedProduct.keywords,
+              requestedProduct.name
+            ),
+            available: options.length > 0,
+            optionCount: options.length,
+
+            // New field for the frontend product-selection UI.
+            options,
+
+            // Keep this field so existing frontend code does not immediately break.
             products: matchedProducts,
           };
         })
       );
 
-      const availableCount = productMatches.filter((p) => p.available).length;
-      const totalRequested = extractedProducts.length;
+      const availableCount = productMatches.filter(
+        (match) => match.available
+      ).length;
 
-      // Calculate centroid of the cluster
+      const totalRequested = extractedProducts.length;
       const centroid = calculateCentroid(cluster.stores);
 
-      // Distance from customer to cluster centroid
-      const distanceKm = haversineDistance(customerLat, customerLng, centroid.lat, centroid.lng);
+      const distanceKm = haversineDistance(
+        customerLat,
+        customerLng,
+        centroid.lat,
+        centroid.lng
+      );
 
-      // Average store rating in cluster
-      const avgRating =
-        cluster.stores.reduce((sum, s) => sum + (s.rating || 0), 0) / cluster.stores.length;
+      const ratedStores = cluster.stores.filter(
+        (store) =>
+          Number.isFinite(Number(store.rating)) &&
+          Number(store.rating) > 0
+      );
 
-      // ── STEP 4: Score the cluster ─────────────────────────────────────────
-      // Weights: Product Availability 50%, Distance 25%, Delivery Efficiency 15%, Ratings 10%
-      const availabilityScore = totalRequested > 0 ? (availableCount / totalRequested) * 100 : 0;
-      const distanceScore = Math.max(0, 100 - (distanceKm / radiusKm) * 100);
-      const efficiencyScore = calculateEfficiencyScore(cluster.stores, distanceKm);
-      const ratingScore = (avgRating / 5) * 100;
+      const avgRating = ratedStores.length
+        ? ratedStores.reduce(
+            (sum, store) => sum + Number(store.rating),
+            0
+          ) / ratedStores.length
+        : 0;
+
+      const availabilityScore = totalRequested
+        ? (availableCount / totalRequested) * 100
+        : 0;
+
+      const distanceScore = Math.max(
+        0,
+        100 * (1 - distanceKm / radiusKm)
+      );
+
+      const efficiencyScore = calculateEfficiencyScore(
+        cluster.stores.length,
+        distanceKm
+      );
+
+      // Stores without ratings receive a neutral score.
+      const ratingScore = ratedStores.length
+        ? (avgRating / 5) * 100
+        : 50;
 
       const totalScore =
-        availabilityScore * 0.5 + distanceScore * 0.25 + efficiencyScore * 0.15 + ratingScore * 0.1;
+        availabilityScore * SCORE_WEIGHTS.availability +
+        distanceScore * SCORE_WEIGHTS.distance +
+        efficiencyScore * SCORE_WEIGHTS.efficiency +
+        ratingScore * SCORE_WEIGHTS.rating;
 
       return {
         clusterId: cluster.id,
         stores: cluster.stores,
         centroid,
-        distanceKm: Math.round(distanceKm * 10) / 10,
+        distanceKm: round(distanceKm, 2),
         productMatches,
         availableCount,
         totalRequested,
-        availabilityScore: Math.round(availabilityScore),
-        distanceScore: Math.round(distanceScore),
-        efficiencyScore: Math.round(efficiencyScore),
-        ratingScore: Math.round(ratingScore),
-        totalScore: Math.round(totalScore),
-        avgRating: Math.round(avgRating * 10) / 10,
+        missingCount: totalRequested - availableCount,
+        availabilityScore: round(availabilityScore),
+        distanceScore: round(distanceScore),
+        efficiencyScore: round(efficiencyScore),
+        ratingScore: round(ratingScore),
+        totalScore: round(totalScore),
+        avgRating: round(avgRating, 1),
       };
     })
   );
 
-  // ── STEP 5: Sort clusters by total score ─────────────────────────────────
-  clustersWithProducts.sort((a, b) => b.totalScore - a.totalScore);
+  // Deterministic ranking with tie-breakers.
+  clustersWithProducts.sort(
+    (a, b) =>
+      b.totalScore - a.totalScore ||
+      b.availableCount - a.availableCount ||
+      a.distanceKm - b.distanceKm ||
+      a.stores.length - b.stores.length ||
+      a.clusterId.localeCompare(b.clusterId)
+  );
+
   const bestCluster = clustersWithProducts[0];
 
-  // ── STEP 6: Border Store Exception (100 meters) ──────────────────────────
-  const missingProducts = bestCluster.productMatches.filter((p) => !p.available);
+  const missingProducts = bestCluster.productMatches.filter(
+    (match) => !match.available
+  );
 
-  if (missingProducts.length > 0) {
-    const borderStores = await findBorderStores(bestCluster.stores, missingProducts, 100);
-    if (borderStores.length > 0) {
-      bestCluster.borderStores = borderStores;
-      bestCluster.borderStoreApplied = true;
-    }
+  if (missingProducts.length) {
+    bestCluster.borderStores = await findBorderStores(
+      bestCluster.stores,
+      missingProducts,
+      BORDER_RADIUS_M
+    );
+  } else {
+    bestCluster.borderStores = [];
   }
 
-  // ── STEP 7: Smart substitutions for anything still missing ───────────────
-  // Border stores fill *the same* item from a neighbor; substitutes suggest a
-  // *different but related* in-stock item instead (e.g. Basmati unavailable ->
-  // suggest Sona Masoori). Still-missing = not found in this cluster AND not
-  // covered by a border store either.
-  const fillableByBorder = new Set((bestCluster.borderStores || []).flatMap((b) => b.fills));
-  const stillMissing = missingProducts.filter((p) => !fillableByBorder.has(p.requestedName));
+  bestCluster.borderStoreApplied =
+    bestCluster.borderStores.length > 0;
 
-  if (stillMissing.length > 0) {
-    const substitutes = await findSubstitutes(bestCluster.stores, stillMissing);
-    if (Object.keys(substitutes).length > 0) {
-      bestCluster.substitutes = substitutes;
-    }
-  }
+  const fulfilledByBorder = new Set(
+    bestCluster.borderStores.flatMap(
+      (borderStore) => borderStore.fills
+    )
+  );
+
+  const stillMissing = missingProducts.filter(
+    (match) =>
+      !fulfilledByBorder.has(normalizeName(match.requestedName))
+  );
+
+  bestCluster.substitutes = stillMissing.length
+    ? await findSubstitutes(bestCluster.stores, stillMissing)
+    : {};
 
   return {
     success: true,
     bestCluster,
     allClusters: clustersWithProducts,
     nearbyStores: nearbyStores.length,
+    borderStores: bestCluster.borderStores,
   };
 };
 
+function validateSearchInput(lat, lng, products, radiusKm) {
+  if (!Number.isFinite(lat) || lat < -90 || lat > 90) {
+    throw new TypeError(
+      'customerLat must be a valid latitude between -90 and 90.'
+    );
+  }
+
+  if (!Number.isFinite(lng) || lng < -180 || lng > 180) {
+    throw new TypeError(
+      'customerLng must be a valid longitude between -180 and 180.'
+    );
+  }
+
+  if (!Array.isArray(products) || products.length === 0) {
+    throw new TypeError(
+      'extractedProducts must be a non-empty array.'
+    );
+  }
+
+  if (
+    products.some(
+      (product) =>
+        !product ||
+        typeof product.name !== 'string' ||
+        !product.name.trim()
+    )
+  ) {
+    throw new TypeError(
+      'Every requested product must have a non-empty name.'
+    );
+  }
+
+  if (
+    !Number.isFinite(radiusKm) ||
+    radiusKm <= 0 ||
+    radiusKm > 100
+  ) {
+    throw new TypeError(
+      'radiusKm must be greater than 0 and no more than 100.'
+    );
+  }
+}
+
 /**
- * DBSCAN-like clustering — groups stores within clusterRadiusM of each other
+ * Groups stores so every pair within a cluster is no more than 500 m apart.
+ * This prevents long chains of nearby stores from stretching a cluster.
  */
-const buildClusters = (stores, clusterRadiusM) => {
-  const visited = new Set();
+function buildClusters(stores, clusterDiameterM) {
+  const sortedStores = [...stores].sort((a, b) => {
+    const [lngA, latA] = a.location.coordinates;
+    const [lngB, latB] = b.location.coordinates;
+
+    return (
+      latA - latB ||
+      lngA - lngB ||
+      String(a._id).localeCompare(String(b._id))
+    );
+  });
+
   const clusters = [];
-  let clusterId = 0;
 
-  for (const store of stores) {
-    if (visited.has(store._id.toString())) continue;
+  for (const store of sortedStores) {
+    const compatibleCluster = clusters.find((cluster) =>
+      cluster.stores.every(
+        (member) =>
+          distanceBetweenStoresM(store, member) <= clusterDiameterM
+      )
+    );
 
-    const cluster = { id: `cluster_${clusterId++}`, stores: [store] };
-    visited.add(store._id.toString());
-
-    for (const otherStore of stores) {
-      if (visited.has(otherStore._id.toString())) continue;
-      const [lng1, lat1] = store.location.coordinates;
-      const [lng2, lat2] = otherStore.location.coordinates;
-      const distM = haversineDistance(lat1, lng1, lat2, lng2) * 1000;
-      if (distM <= clusterRadiusM) {
-        cluster.stores.push(otherStore);
-        visited.add(otherStore._id.toString());
-      }
+    if (compatibleCluster) {
+      compatibleCluster.stores.push(store);
+    } else {
+      clusters.push({
+        id: `cluster_${clusters.length}`,
+        stores: [store],
+      });
     }
-
-    clusters.push(cluster);
   }
 
   return clusters;
-};
+}
 
-/**
- * Calculates geographic centroid of a group of stores
- */
-const calculateCentroid = (stores) => {
+function distanceBetweenStoresM(a, b) {
+  const [lngA, latA] = a.location.coordinates;
+  const [lngB, latB] = b.location.coordinates;
+
+  return haversineDistance(latA, lngA, latB, lngB) * 1000;
+}
+
+function calculateCentroid(stores) {
   const sum = stores.reduce(
-    (acc, s) => ({
-      lat: acc.lat + s.location.coordinates[1],
-      lng: acc.lng + s.location.coordinates[0],
+    (acc, store) => ({
+      lat: acc.lat + store.location.coordinates[1],
+      lng: acc.lng + store.location.coordinates[0],
     }),
     { lat: 0, lng: 0 }
   );
-  return { lat: sum.lat / stores.length, lng: sum.lng / stores.length };
-};
+
+  return {
+    lat: sum.lat / stores.length,
+    lng: sum.lng / stores.length,
+  };
+}
+
+function calculateEfficiencyScore(storeCount, distanceKm) {
+  const storeCountScore = Math.max(
+    0,
+    100 - Math.max(0, storeCount - 1) * 10
+  );
+
+  const distanceScore = Math.max(0, 100 - distanceKm * 15);
+
+  return (storeCountScore + distanceScore) / 2;
+}
+
+async function findMatchingProducts(requestedProduct, storeIds) {
+  const conditions = buildProductConditions(requestedProduct);
+
+  if (!conditions.length) return [];
+
+  return Product.find({
+    storeId: { $in: storeIds },
+    isAvailable: true,
+    stock: { $gt: 0 },
+    $or: conditions,
+  }).populate('storeId', 'storeName location');
+}
 
 /**
- * Efficiency score — penalizes clusters with many stores (more pickups = less efficient)
+ * Adds a stable productId and normalized choice fields.
+ * Original product fields are retained for compatibility.
  */
-const calculateEfficiencyScore = (stores, distanceKm) => {
-  const storeCountPenalty = Math.max(0, 100 - (stores.length - 1) * 10);
-  const distancePenalty = Math.max(0, 100 - distanceKm * 15);
-  return (storeCountPenalty + distancePenalty) / 2;
-};
+function toProductOption(product) {
+  const raw =
+    typeof product.toObject === 'function'
+      ? product.toObject()
+      : { ...product };
+
+  const store =
+    raw.storeId && typeof raw.storeId === 'object'
+      ? {
+          _id: raw.storeId._id,
+          storeName: raw.storeId.storeName,
+          location: raw.storeId.location,
+        }
+      : raw.storeId;
+
+  const rawPrice =
+    raw.price ?? raw.sellingPrice ?? raw.salePrice ?? null;
+
+  const parsedPrice =
+    rawPrice === null || rawPrice === ''
+      ? null
+      : Number(rawPrice);
+
+  return {
+    ...raw,
+    _id: raw._id,
+    productId: String(raw._id),
+    name: raw.name || 'Unnamed product',
+    brand:
+      raw.brand || raw.company || raw.manufacturer || null,
+    price: Number.isFinite(parsedPrice) ? parsedPrice : null,
+    stock: Number.isFinite(Number(raw.stock))
+      ? Number(raw.stock)
+      : 0,
+    storeId: store,
+    storeName:
+      store && typeof store === 'object'
+        ? store.storeName || null
+        : null,
+  };
+}
+
+function buildProductConditions(requestedProduct) {
+  const name = String(requestedProduct.name || '').trim();
+
+  const keywords = normalizeKeywords(
+    requestedProduct.keywords,
+    name
+  );
+
+  const conditions = [];
+
+  if (name) {
+    conditions.push({
+      name: { $regex: escapeRegex(name), $options: 'i' },
+    });
+  }
+
+  for (const keyword of keywords) {
+    conditions.push({
+      tags: { $regex: escapeRegex(keyword), $options: 'i' },
+    });
+
+    conditions.push({
+      nameKeywords: {
+        $regex: escapeRegex(keyword),
+        $options: 'i',
+      },
+    });
+  }
+
+  return conditions;
+}
 
 /**
- * Border Store Exception — finds verified stores within 100m of any cluster store
- * that carry the missing products
+ * Finds eligible stores within 100 m of a cluster and identifies
+ * which missing requested products each border store can supply.
  */
-const findBorderStores = async (clusterStores, missingProducts, thresholdM) => {
-  const missingNames = missingProducts.map((p) => p.requestedName);
-  const clusterStoreIds = clusterStores.map((s) => s._id);
-  const borderResults = [];
+async function findBorderStores(
+  clusterStores,
+  missingProducts,
+  thresholdM
+) {
+  const clusterStoreIds = clusterStores.map((store) => store._id);
+  const candidatesById = new Map();
 
   for (const clusterStore of clusterStores) {
     const [storeLng, storeLat] = clusterStore.location.coordinates;
 
-    // Find verified stores within thresholdM that are NOT already in the cluster
-    const candidateStores = await Store.find({
+    const candidates = await Store.find({
       verificationStatus: 'approved',
       isActive: true,
       isOpen: { $ne: false },
       _id: { $nin: clusterStoreIds },
       location: {
         $near: {
-          $geometry: { type: 'Point', coordinates: [storeLng, storeLat] },
+          $geometry: {
+            type: 'Point',
+            coordinates: [storeLng, storeLat],
+          },
           $maxDistance: thresholdM,
         },
       },
-    });
+    }).select('storeName location address rating totalOrders');
 
-    for (const candidate of candidateStores) {
-      // Check if this border store has any missing products
-      const matchedMissing = await Product.find({
-        storeId: candidate._id,
-        isAvailable: true,
-        stock: { $gt: 0 },
-        $or: missingNames.map((name) => ({
-          $or: [
-            { name: { $regex: escapeRegex(name), $options: 'i' } },
-            { tags: name },
-            { nameKeywords: name },
-          ],
-        })),
-      });
+    for (const candidate of candidates) {
+      const id = String(candidate._id);
+      const distanceM = distanceBetweenStoresM(
+        clusterStore,
+        candidate
+      );
 
-      if (matchedMissing.length > 0) {
-        const distanceM =
-          haversineDistance(
-            storeLat,
-            storeLng,
-            candidate.location.coordinates[1],
-            candidate.location.coordinates[0]
-          ) * 1000;
+      const previous = candidatesById.get(id);
 
-        borderResults.push({
+      if (
+        !previous ||
+        distanceM < previous.distanceFromClusterM
+      ) {
+        candidatesById.set(id, {
           store: candidate,
-          products: matchedMissing,
-          distanceFromClusterM: Math.round(distanceM),
-          fills: matchedMissing.map((p) => p.name),
+          distanceFromClusterM: distanceM,
         });
       }
     }
   }
 
-  return borderResults;
-};
+  const results = [];
 
-// Common words that are too generic to search on alone (would match almost anything).
-const STOPWORDS = new Set(['of', 'a', 'an', 'the', 'and', 'or', 'for', 'with', 'pack', 'piece']);
+  for (const {
+    store,
+    distanceFromClusterM,
+  } of candidatesById.values()) {
+    const fills = [];
+    const products = [];
+
+    for (const missing of missingProducts) {
+      const matched = await findMatchingProducts(
+        {
+          name: missing.requestedName,
+          keywords: missing.requestedKeywords,
+        },
+        [store._id]
+      );
+
+      if (matched.length) {
+        fills.push(normalizeName(missing.requestedName));
+        products.push(...matched.map(toProductOption));
+      }
+    }
+
+    if (fills.length) {
+      results.push({
+        store,
+        products,
+        fills: [...new Set(fills)],
+        distanceFromClusterM: Math.round(distanceFromClusterM),
+      });
+    }
+  }
+
+  return results.sort(
+    (a, b) =>
+      b.fills.length - a.fills.length ||
+      a.distanceFromClusterM - b.distanceFromClusterM
+  );
+}
 
 /**
- * Smart substitution — NOT true semantic/AI matching (this stack has no embeddings or
- * NLP service). It's a keyword-overlap heuristic: break the requested name + its Groq
- * keywords into significant words, then look for other in-stock products in the cluster
- * that share at least one of those words. Good enough to catch "basmati rice" -> "sona
- * masoori rice" (both share "rice") without needing external AI infrastructure.
+ * Keyword-based alternatives. This is a heuristic, not semantic AI matching.
  */
-const findSubstitutes = async (clusterStores, stillMissingProducts) => {
-  const storeIds = clusterStores.map((s) => s._id);
+async function findSubstitutes(clusterStores, stillMissingProducts) {
+  const storeIds = clusterStores.map((store) => store._id);
   const results = {};
 
   for (const missing of stillMissingProducts) {
-    const words = [missing.requestedName, ...(missing.products?.[0]?.keywords || [])]
-      .join(' ')
-      .toLowerCase()
-      .split(/\s+/)
-      .filter((w) => w.length > 2 && !STOPWORDS.has(w));
+    const requestedName = String(
+      missing.requestedName || ''
+    ).trim();
 
-    if (words.length === 0) continue;
+    const words = [
+      ...new Set(
+        [
+          requestedName,
+          ...(missing.requestedKeywords || []),
+        ]
+          .join(' ')
+          .toLowerCase()
+          .split(/[^a-z0-9]+/i)
+          .filter(
+            (word) =>
+              word.length > 2 && !STOPWORDS.has(word)
+          )
+      ),
+    ];
+
+    if (!words.length) continue;
+
+    const conditions = words.flatMap((word) => [
+      {
+        name: { $regex: escapeRegex(word), $options: 'i' },
+      },
+      {
+        tags: { $regex: escapeRegex(word), $options: 'i' },
+      },
+      {
+        nameKeywords: {
+          $regex: escapeRegex(word),
+          $options: 'i',
+        },
+      },
+    ]);
 
     const candidates = await Product.find({
       storeId: { $in: storeIds },
       isAvailable: true,
       stock: { $gt: 0 },
-      $or: words.map((w) => ({
-        $or: [
-          { name: { $regex: escapeRegex(w), $options: 'i' } },
-          { tags: { $regex: escapeRegex(w), $options: 'i' } },
-          { nameKeywords: { $regex: escapeRegex(w), $options: 'i' } },
-        ],
-      })),
+      $or: conditions,
+      name: {
+        $not: {
+          $regex: escapeRegex(requestedName),
+          $options: 'i',
+        },
+      },
     })
       .populate('storeId', 'storeName location')
-      .limit(3);
+      .limit(10);
 
-    if (candidates.length > 0) {
-      results[missing.requestedName] = candidates;
+    const seen = new Set();
+
+    const ranked = candidates
+      .map((product) => {
+        const candidateWords = normalizeName(
+          `${product.name || ''} ${(product.tags || []).join(' ')} ${(product.nameKeywords || []).join(' ')}`
+        ).split(/\s+/);
+
+        const overlap = words.filter(
+          (word) => candidateWords.includes(word)
+        ).length;
+
+        return { product, overlap };
+      })
+      .filter(({ product, overlap }) => {
+        const id = String(product._id);
+
+        if (!overlap || seen.has(id)) return false;
+
+        seen.add(id);
+        return true;
+      })
+      .sort((a, b) => b.overlap - a.overlap)
+      .slice(0, 3)
+      .map(({ product }) => toProductOption(product));
+
+    if (ranked.length) {
+      results[requestedName] = ranked;
     }
   }
 
   return results;
-};
+}
 
-// Prevents user-supplied product names from breaking the $regex query
-const escapeRegex = (str) => str.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+function normalizeKeywords(keywords, fallbackName) {
+  const source = Array.isArray(keywords) ? keywords : [];
+
+  const normalized = source
+    .filter(
+      (keyword) =>
+        typeof keyword === 'string' && keyword.trim()
+    )
+    .map((keyword) => keyword.trim());
+
+  if (
+    fallbackName &&
+    !normalized.some(
+      (keyword) =>
+        normalizeName(keyword) === normalizeName(fallbackName)
+    )
+  ) {
+    normalized.push(String(fallbackName).trim());
+  }
+
+  return [...new Set(normalized)];
+}
+
+function normalizeName(value) {
+  return String(value || '')
+    .trim()
+    .toLowerCase()
+    .replace(/\s+/g, ' ');
+}
+
+function escapeRegex(value) {
+  return String(value).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+function round(value, digits = 0) {
+  const factor = 10 ** digits;
+  return Math.round(value * factor) / factor;
+}
 
 module.exports = { findBestCluster };

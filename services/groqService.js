@@ -1,3 +1,4 @@
+
 const groq = require('../config/groq');
 
 const SYSTEM_PROMPT = `You are a grocery shopping assistant. Extract all grocery products from the user's message.
@@ -16,38 +17,61 @@ Example output:
 
 const extractProductsFromText = async (userInput) => {
   const completion = await groq.chat.completions.create({
-    model: 'llama-3.1-8b-instant', // llama3-8b-8192 was decommissioned by Groq; this is its direct replacement
+    model: 'openai/gpt-oss-20b',
     messages: [
       { role: 'system', content: SYSTEM_PROMPT },
       { role: 'user', content: userInput },
     ],
-    temperature: 0.1, // low temperature for consistent structured output
+    temperature: 0.1,
     max_tokens: 1000,
   });
 
-  const raw = completion.choices[0].message.content;
-  // Strip any accidental markdown fences
-  const clean = raw.replace(/```json|```/g, '').trim();
+  const raw = completion.choices?.[0]?.message?.content;
+
+  if (!raw || typeof raw !== 'string') {
+    throw new Error('AI returned an empty response. Please try again.');
+  }
+
+  const clean = raw
+    .replace(/```json/gi, '')
+    .replace(/```/g, '')
+    .trim();
 
   let parsed;
+
   try {
     parsed = JSON.parse(clean);
   } catch (err) {
-    throw new Error('AI response could not be parsed. Please rephrase your list and try again.');
+    throw new Error(
+      'AI response could not be parsed. Please rephrase your list and try again.'
+    );
   }
 
   if (!Array.isArray(parsed)) {
     throw new Error('AI did not return a product list. Please try again.');
   }
 
-  // Normalize + guard against malformed entries
   return parsed
-    .filter((p) => p && typeof p.name === 'string' && p.name.trim().length > 0)
+    .filter(
+      (p) =>
+        p &&
+        typeof p.name === 'string' &&
+        p.name.trim().length > 0
+    )
     .map((p) => ({
       name: p.name.trim().toLowerCase(),
-      quantity: typeof p.quantity === 'number' && p.quantity > 0 ? p.quantity : 1,
-      unit: typeof p.unit === 'string' && p.unit.trim() ? p.unit.trim() : 'piece',
-      keywords: Array.isArray(p.keywords) && p.keywords.length ? p.keywords : [p.name.trim().toLowerCase()],
+      quantity:
+        typeof p.quantity === 'number' && p.quantity > 0
+          ? p.quantity
+          : 1,
+      unit:
+        typeof p.unit === 'string' && p.unit.trim()
+          ? p.unit.trim().toLowerCase()
+          : 'piece',
+      keywords:
+        Array.isArray(p.keywords) && p.keywords.length
+          ? p.keywords.filter((k) => typeof k === 'string')
+          : [p.name.trim().toLowerCase()],
     }));
 };
 
